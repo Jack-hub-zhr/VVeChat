@@ -743,8 +743,13 @@ app.delete('/api/messages/:id', authRequired, (req, res) => {
   if (!row) return res.status(404).json({ error: '消息不存在' });
   const jackMode = isAdmin(req.user);
   if (!jackMode && row.sender_id !== req.user.id) return res.status(403).json({ error: '只能删除自己的消息' });
+  // Non-Jack users can only recall their own message within 2 minutes
+  if (!jackMode) {
+    const ageMs = Date.now() - new Date(row.created_at + 'Z').getTime();
+    if (ageMs > 2 * 60 * 1000) return res.status(403).json({ error: '只能撤回 2 分钟内的消息' });
+  }
   if (row.is_deleted && !jackMode) return res.json({ ok: true });
-  // Jack: hard delete. Others: soft delete.
+  // Jack: hard delete. Others: soft delete (撤回).
   if (jackMode) {
     db.prepare('DELETE FROM messages WHERE id = ?').run(id);
   } else {
@@ -1026,6 +1031,25 @@ io.on('connection', (socket) => {
     console.log(`[VVeChat] user ${uid} disconnected`);
   });
 });
+
+// ============================================================
+// 30-day message auto-deletion (cleanup job)
+// Runs on startup and every hour
+// ============================================================
+function cleanupOldMessages() {
+  try {
+    const cutoffMs = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const cutoffIso = new Date(cutoffMs).toISOString().replace('T', ' ').slice(0, 19);
+    // Also clean orphaned reactions pointing to deleted messages
+    const delMsgs = db.prepare("DELETE FROM messages WHERE created_at < ?").run(cutoffIso);
+    const delRxns = db.prepare("DELETE FROM message_reactions WHERE message_id NOT IN (SELECT id FROM messages)").run();
+    if (delMsgs.changes || delRxns.changes) {
+      console.log(`[VVeChat] cleanup: removed ${delMsgs.changes} messages (>30d), ${delRxns.changes} orphan reactions`);
+    }
+  } catch (e) { console.error('[VVeChat] cleanup error:', e); }
+}
+cleanupOldMessages();
+setInterval(cleanupOldMessages, 60 * 60 * 1000); // every hour
 
 server.listen(PORT, () => {
   console.log(`[VVeChat] listening on http://0.0.0.0:${PORT}`);
