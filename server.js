@@ -194,12 +194,18 @@ app.post('/api/admin/wipe', authRequired, requireAdmin, (req, res) => {
       DELETE FROM users;
       DELETE FROM sqlite_sequence;
     `);
-    // recreate official group so subsequent registrations still auto-join
+    // re-seed Jack so the admin can immediately log back in
+    const jackHash = bcrypt.hashSync('1234', 10);
+    db.prepare(
+      `INSERT INTO users (username, password_hash, avatar_color, bio, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run('Jack', jackHash, '#fbbf24', 'VVeChat 官方管理员', now());
+    // recreate official group
     const info = db.prepare(
       'INSERT INTO groups (name, owner_id, is_official, created_at) VALUES (?, NULL, 1, ?)'
     ).run('VVeChat 官方群', now());
     OFFICIAL_GROUP_ID = info.lastInsertRowid;
-    res.json({ ok: true, wiped: true, official_group_id: OFFICIAL_GROUP_ID });
+    res.json({ ok: true, wiped: true, official_group_id: OFFICIAL_GROUP_ID, jack_reseeded: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -320,7 +326,7 @@ app.get('/api/me', authRequired, (req, res) => {
 });
 
 app.put('/api/me', authRequired, (req, res) => {
-  const { bio, username } = req.body || {};
+  const { bio, username, avatar_color, avatar } = req.body || {};
   const u = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
   if (!u) return res.status(404).json({ error: 'user not found' });
   const updates = [];
@@ -329,7 +335,28 @@ app.put('/api/me', authRequired, (req, res) => {
     if (bio.length > 200) return res.status(400).json({ error: '简介不超过 200 字' });
     updates.push('bio = ?'); values.push(bio);
   }
-  // avatar_color is auto-assigned at registration and is NOT user-changeable
+  // avatar_color: user can now pick (any CSS color string, max 32 chars)
+  if (typeof avatar_color === 'string' && avatar_color.trim()) {
+    const c = avatar_color.trim();
+    if (c.length > 32) return res.status(400).json({ error: '颜色格式无效' });
+    updates.push('avatar_color = ?'); values.push(c);
+  }
+  // avatar: data URL (data:image/...;base64,...) or null/empty to clear
+  if (typeof avatar === 'string') {
+    if (avatar === '' || avatar === null) {
+      updates.push('avatar = ?'); values.push(null);
+    } else {
+      if (!/^data:image\/(png|jpe?g|webp|gif);base64,/i.test(avatar)) {
+        return res.status(400).json({ error: '头像图片格式不支持（仅 PNG/JPG/WebP/GIF）' });
+      }
+      // base64 payload size check (~2.5MB max → 3.3MB b64)
+      const b64 = avatar.split(',')[1] || '';
+      if (b64.length > 3.5 * 1024 * 1024) {
+        return res.status(413).json({ error: '头像图片过大（>2.5MB）' });
+      }
+      updates.push('avatar = ?'); values.push(avatar);
+    }
+  }
   if (typeof username === 'string' && username.trim() && username !== u.username) {
     if (username.length < 2 || username.length > 24) return res.status(400).json({ error: '用户名长度需 2-24' });
     const existing = db.prepare('SELECT id FROM users WHERE username = ? AND id != ?').get(username, u.id);
