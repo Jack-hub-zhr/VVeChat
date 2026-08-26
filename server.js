@@ -1,4 +1,4 @@
-/** VVeChat backend v29.1 - force deploy */
+/**
  * VVeChat backend (v2 — online status, typing, read receipts, reactions, profile, reply, delete)
  * - Express REST API
  * - Socket.io realtime channel
