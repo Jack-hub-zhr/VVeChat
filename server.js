@@ -1081,3 +1081,4 @@ setInterval(cleanupOldMessages, 60 * 60 * 1000); // every hour
 server.listen(PORT, () => {
   console.log(`[VVeChat] listening on http://0.0.0.0:${PORT}`);
 });
+// re-deploy trigger 2026-08-26T23:33:46Z
