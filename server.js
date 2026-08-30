@@ -651,6 +651,7 @@ function buildMessage(row) {
     conv_id: row.conv_id,
     sender_id: row.sender_id,
     sender_username: row.sender_username,
+    sender_avatar_color: row.sender_avatar_color || null,
     content: row.is_deleted ? '' : row.content,
     type: row.type || 'text',
     meta,
@@ -664,7 +665,7 @@ function buildMessage(row) {
 // a view for reply joins
 db.exec(`
   CREATE VIEW IF NOT EXISTS messages_view AS
-  SELECT m.*, u.username AS sender_username
+  SELECT m.*, u.username AS sender_username, u.avatar_color AS sender_avatar_color
   FROM messages m
   JOIN users u ON u.id = m.sender_id
 `);
@@ -726,7 +727,7 @@ app.get('/api/messages', authRequired, (req, res) => {
     normalizedConvId = userConvId(req.user.id, peerId);
   }
   const rows = db.prepare(`
-    SELECT m.*, u.username AS sender_username
+    SELECT m.*, u.username AS sender_username, u.avatar_color AS sender_avatar_color
     FROM messages m
     JOIN users u ON u.id = m.sender_id
     WHERE m.conv_type = ? AND m.conv_id = ?
