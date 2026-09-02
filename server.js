@@ -102,7 +102,47 @@ db.exec(`
     created_at INTEGER NOT NULL,
     PRIMARY KEY (message_id, user_id, emoji)
   );
+
+  -- 社区贴吧 (forum boards) and posts
+  CREATE TABLE IF NOT EXISTS boards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    description TEXT,
+    icon_color TEXT,
+    creator_id INTEGER,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS board_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    board_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    reply_count INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS board_replies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
 `);
+
+// Seed a few default boards on first run
+{
+  const c = db.prepare('SELECT COUNT(*) AS n FROM boards').get().n;
+  if (c === 0) {
+    const seed = [
+      { name: 'VVeChat 公告', description: '官方公告与功能更新', color: '#8b5cf6' },
+      { name: '水聊大厅',     description: '随便聊聊任何事情',     color: '#60a5fa' },
+      { name: '技术交流',     description: '前端、后端、设计、想法', color: '#34d399' },
+    ];
+    const ins = db.prepare('INSERT INTO boards (name, description, icon_color, creator_id, created_at) VALUES (?, ?, ?, NULL, ?)');
+    for (const b of seed) ins.run(b.name, b.description, b.color, now());
+  }
+}
 
 // lightweight migrations — add columns to existing tables if missing
 function columnExists(table, col) {
@@ -283,8 +323,22 @@ app.post('/api/register', (req, res) => {
   if (!username || !password) return res.status(400).json({ error: '用户名和密码不能为空' });
   if (username.length < 2 || username.length > 24) return res.status(400).json({ error: '用户名长度需 2-24' });
   if (password.length < 4) return res.status(400).json({ error: '密码至少 4 位' });
-  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
-  if (existing) return res.status(409).json({ error: '该用户名已被注册' });
+  // Relaxed uniqueness: allow registration if EITHER the username OR the
+  // password does not collide with any existing account. This means a user
+  // can have multiple accounts as long as one of the two fields differs.
+  const exact = db.prepare(
+    'SELECT id FROM users WHERE username = ? AND password_hash = ?'
+  ).get(username, password);
+  if (exact) return res.status(409).json({ error: '该用户名+密码组合已存在' });
+  const sameBoth = db.prepare(
+    'SELECT id FROM users WHERE username = ?'
+  ).get(username);
+  const samePwd = db.prepare(
+    'SELECT id FROM users WHERE password_hash = ?'
+  ).get(bcrypt.hashSync(password, 10));
+  if (sameBoth && samePwd) {
+    return res.status(409).json({ error: '用户名和密码都已被注册（请至少修改一项）' });
+  }
 
   // pick a fun color for new users
   const palette = ['#5eead4','#60a5fa','#c084fc','#f472b6','#fbbf24','#fb923c','#4ade80','#22d3ee','#a78bfa','#f87171'];
@@ -1066,18 +1120,121 @@ io.on('connection', (socket) => {
 // ============================================================
 function cleanupOldMessages() {
   try {
-    const cutoffMs = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    // Retain messages for 1 year; auto-clear older ones to save space
+    const cutoffMs = Date.now() - 365 * 24 * 60 * 60 * 1000;
     const cutoffIso = new Date(cutoffMs).toISOString().replace('T', ' ').slice(0, 19);
     // Also clean orphaned reactions pointing to deleted messages
     const delMsgs = db.prepare("DELETE FROM messages WHERE created_at < ?").run(cutoffIso);
     const delRxns = db.prepare("DELETE FROM message_reactions WHERE message_id NOT IN (SELECT id FROM messages)").run();
     if (delMsgs.changes || delRxns.changes) {
-      console.log(`[VVeChat] cleanup: removed ${delMsgs.changes} messages (>30d), ${delRxns.changes} orphan reactions`);
+      console.log(`[VVeChat] cleanup: removed ${delMsgs.changes} messages (>1y), ${delRxns.changes} orphan reactions`);
     }
   } catch (e) { console.error('[VVeChat] cleanup error:', e); }
 }
 cleanupOldMessages();
 setInterval(cleanupOldMessages, 60 * 60 * 1000); // every hour
+
+// ============================================================
+// 社区贴吧 (Forum boards) — public boards with posts & replies
+// ============================================================
+
+// list all boards
+app.get('/api/boards', authRequired, (req, res) => {
+  const rows = db.prepare(`
+    SELECT b.id, b.name, b.description, b.icon_color, b.creator_id, b.created_at,
+           (SELECT COUNT(*) FROM board_posts p WHERE p.board_id = b.id) AS post_count
+    FROM boards b
+    ORDER BY b.id ASC
+  `).all();
+  res.json({ boards: rows });
+});
+
+// create a new board
+app.post('/api/boards', authRequired, (req, res) => {
+  const { name, description, icon_color } = req.body || {};
+  const n = (name || '').trim();
+  if (n.length < 2 || n.length > 30) return res.status(400).json({ error: '吧名长度需 2-30 字' });
+  const existing = db.prepare('SELECT id FROM boards WHERE name = ?').get(n);
+  if (existing) return res.status(409).json({ error: '该吧名已存在' });
+  const info = db.prepare(
+    'INSERT INTO boards (name, description, icon_color, creator_id, created_at) VALUES (?, ?, ?, ?, ?)'
+  ).run(n, (description || '').slice(0, 200), icon_color || '#8b5cf6', req.user.id, now());
+  const row = db.prepare('SELECT * FROM boards WHERE id = ?').get(info.lastInsertRowid);
+  res.json({ board: row });
+});
+
+// posts in a board
+app.get('/api/boards/:id/posts', authRequired, (req, res) => {
+  const id = Number(req.params.id);
+  const rows = db.prepare(`
+    SELECT p.id, p.board_id, p.user_id, p.title, p.content, p.reply_count, p.created_at,
+           u.username, u.avatar_color, u.is_admin
+    FROM board_posts p
+    JOIN users u ON u.id = p.user_id
+    WHERE p.board_id = ?
+    ORDER BY p.created_at DESC
+    LIMIT 100
+  `).all(id);
+  res.json({ posts: rows });
+});
+
+// create a new post in a board
+app.post('/api/boards/:id/posts', authRequired, (req, res) => {
+  const id = Number(req.params.id);
+  const board = db.prepare('SELECT id FROM boards WHERE id = ?').get(id);
+  if (!board) return res.status(404).json({ error: '吧不存在' });
+  const { title, content } = req.body || {};
+  const t1 = (title || '').trim();
+  const c1 = (content || '').trim();
+  if (t1.length < 2 || t1.length > 80) return res.status(400).json({ error: '标题需 2-80 字' });
+  if (c1.length < 1 || c1.length > 5000) return res.status(400).json({ error: '内容需 1-5000 字' });
+  const info = db.prepare(`
+    INSERT INTO board_posts (board_id, user_id, title, content, reply_count, created_at)
+    VALUES (?, ?, ?, ?, 0, ?)
+  `).run(id, req.user.id, t1, c1, now());
+  const row = db.prepare(`
+    SELECT p.*, u.username, u.avatar_color, u.is_admin
+    FROM board_posts p JOIN users u ON u.id = p.user_id
+    WHERE p.id = ?
+  `).get(info.lastInsertRowid);
+  res.json({ post: row });
+});
+
+// replies on a post
+app.get('/api/posts/:id/replies', authRequired, (req, res) => {
+  const id = Number(req.params.id);
+  const rows = db.prepare(`
+    SELECT r.id, r.post_id, r.user_id, r.content, r.created_at,
+           u.username, u.avatar_color, u.is_admin
+    FROM board_replies r
+    JOIN users u ON u.id = r.user_id
+    WHERE r.post_id = ?
+    ORDER BY r.created_at ASC
+    LIMIT 200
+  `).all(id);
+  res.json({ replies: rows });
+});
+
+// add a reply
+app.post('/api/posts/:id/replies', authRequired, (req, res) => {
+  const id = Number(req.params.id);
+  const post = db.prepare('SELECT id FROM board_posts WHERE id = ?').get(id);
+  if (!post) return res.status(404).json({ error: '帖子不存在' });
+  const { content } = req.body || {};
+  const c1 = (content || '').trim();
+  if (c1.length < 1 || c1.length > 2000) return res.status(400).json({ error: '回复需 1-2000 字' });
+  const info = db.prepare(`
+    INSERT INTO board_replies (post_id, user_id, content, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(id, req.user.id, c1, now());
+  db.prepare('UPDATE board_posts SET reply_count = reply_count + 1 WHERE id = ?').run(id);
+  const row = db.prepare(`
+    SELECT r.*, u.username, u.avatar_color, u.is_admin
+    FROM board_replies r JOIN users u ON u.id = r.user_id
+    WHERE r.id = ?
+  `).get(info.lastInsertRowid);
+  res.json({ reply: row });
+});
 
 server.listen(PORT, () => {
   console.log(`[VVeChat] listening on http://0.0.0.0:${PORT}`);
