@@ -1,4 +1,4 @@
-// force fresh deploy 2026-09-05
+/** VVeChat v35 - force deploy for Render */
  * VVeChat backend (v2 — online status, typing, read receipts, reactions, profile, reply, delete)
  * - Express REST API
  * - Socket.io realtime channel
