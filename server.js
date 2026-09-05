@@ -1,4 +1,4 @@
-/**
+// force fresh deploy 2026-09-05
  * VVeChat backend (v2 — online status, typing, read receipts, reactions, profile, reply, delete)
  * - Express REST API
  * - Socket.io realtime channel
