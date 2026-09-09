@@ -102,46 +102,19 @@ db.exec(`
     created_at INTEGER NOT NULL,
     PRIMARY KEY (message_id, user_id, emoji)
   );
-
-  -- 社区贴吧 (forum boards) and posts
-  CREATE TABLE IF NOT EXISTS boards (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL,
-    description TEXT,
-    icon_color TEXT,
-    creator_id INTEGER,
-    created_at INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS board_posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    board_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    content TEXT NOT NULL,
-    reply_count INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS board_replies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    post_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  );
 `);
 
-// Seed a few default boards on first run
+// Add recommended + announcement + pinned columns to groups if missing
 {
-  const c = db.prepare('SELECT COUNT(*) AS n FROM boards').get().n;
-  if (c === 0) {
-    const seed = [
-      { name: 'VVeChat 公告', description: '官方公告与功能更新', color: '#8b5cf6' },
-      { name: '水聊大厅',     description: '随便聊聊任何事情',     color: '#60a5fa' },
-      { name: '技术交流',     description: '前端、后端、设计、想法', color: '#34d399' },
-    ];
-    const ins = db.prepare('INSERT INTO boards (name, description, icon_color, creator_id, created_at) VALUES (?, ?, ?, NULL, ?)');
-    for (const b of seed) ins.run(b.name, b.description, b.color, now());
-  }
+  const cols = db.prepare("PRAGMA table_info(groups)").all();
+  const names = new Set(cols.map(c => c.name));
+  if (!names.has('recommended')) db.exec("ALTER TABLE groups ADD COLUMN recommended INTEGER NOT NULL DEFAULT 1");
+  if (!names.has('announcement')) db.exec("ALTER TABLE groups ADD COLUMN announcement TEXT");
+  if (!names.has('pinned')) db.exec("ALTER TABLE groups ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0");
+  if (!names.has('icon_color')) db.exec("ALTER TABLE groups ADD COLUMN icon_color TEXT");
+  if (!names.has('owner_id')) db.exec("ALTER TABLE groups ADD COLUMN owner_id INTEGER");
+  // Backfill: existing groups (official group) default to recommended=1
+  db.exec("UPDATE groups SET recommended = 1 WHERE recommended = 0");
 }
 
 // lightweight migrations — add columns to existing tables if missing
@@ -477,7 +450,8 @@ app.get('/api/friends', authRequired, (req, res) => {
 // groups (joined)
 app.get('/api/groups', authRequired, (req, res) => {
   const rows = db.prepare(`
-    SELECT g.id, g.name, g.is_official, g.owner_id
+    SELECT g.id, g.name, g.is_official, g.owner_id, g.icon_color, g.recommended, g.pinned, g.announcement,
+           (SELECT COUNT(*) FROM group_members m WHERE m.group_id = g.id) AS member_count
     FROM group_members gm
     JOIN groups g ON g.id = gm.group_id
     WHERE gm.user_id = ?
@@ -543,19 +517,79 @@ app.post('/api/groups/:id/members', authRequired, (req, res) => {
 // Update group name. Only the official group requires Jack; regular groups allow any member.
 app.put('/api/groups/:id', authRequired, (req, res) => {
   const gid = Number(req.params.id);
-  const { name } = req.body || {};
-  if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: '名称不能为空' });
-  if (name.length > 40) return res.status(400).json({ error: '群名称不超过 40 字' });
-  const g = db.prepare('SELECT id, name, is_official FROM groups WHERE id = ?').get(gid);
+  const { name, recommended, announcement, pinned, icon_color } = req.body || {};
+  const g = db.prepare('SELECT id, name, is_official, owner_id FROM groups WHERE id = ?').get(gid);
   if (!g) return res.status(404).json({ error: '群不存在' });
-  if (g.is_official && req.user.username !== 'Jack') return res.status(403).json({ error: '只有 Jack 才能修改官方群名称' });
   const inGroup = db.prepare('SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?').get(gid, req.user.id);
   if (!inGroup) return res.status(403).json({ error: 'not in group' });
-  db.prepare('UPDATE groups SET name = ? WHERE id = ?').run(name.trim(), gid);
-  // broadcast to all members so the group name updates everywhere
+  const isOwner = g.owner_id === req.user.id;
+  const isAdmin = req.user.username === 'Jack';
+  const sets = []; const vals = [];
+  if (typeof name === 'string' && name.trim()) {
+    if (name.length > 40) return res.status(400).json({ error: '群名称不超过 40 字' });
+    if (g.is_official && !isAdmin) return res.status(403).json({ error: '只有 Jack 才能修改官方群名称' });
+    sets.push('name = ?'); vals.push(name.trim());
+  }
+  if (typeof recommended === 'boolean') {
+    if (!isOwner && !isAdmin) return res.status(403).json({ error: '只有群主或管理员可设置推荐' });
+    sets.push('recommended = ?'); vals.push(recommended ? 1 : 0);
+  }
+  if (typeof announcement === 'string') {
+    if (!isOwner && !isAdmin) return res.status(403).json({ error: '只有群主或管理员可设置公告' });
+    sets.push('announcement = ?'); vals.push(announcement.slice(0, 200));
+  }
+  if (typeof pinned === 'boolean') {
+    sets.push('pinned = ?'); vals.push(pinned ? 1 : 0);
+  }
+  if (typeof icon_color === 'string' && icon_color) {
+    sets.push('icon_color = ?'); vals.push(icon_color);
+  }
+  if (!sets.length) return res.json({ ok: true });
+  vals.push(gid);
+  db.prepare(`UPDATE groups SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+  const fresh = db.prepare('SELECT * FROM groups WHERE id = ?').get(gid);
+  // broadcast to all members
   const members = db.prepare('SELECT user_id FROM group_members WHERE group_id = ?').all(gid);
-  for (const m of members) io.to(`user:${m.user_id}`).emit('group:renamed', { groupId: gid, name: name.trim() });
-  res.json({ ok: true, name: name.trim() });
+  for (const m of members) io.to(`user:${m.user_id}`).emit('group:updated', fresh);
+  res.json({ ok: true, group: fresh });
+});
+
+// Leave a group
+app.post('/api/groups/:id/leave', authRequired, (req, res) => {
+  const gid = Number(req.params.id);
+  const g = db.prepare('SELECT id, is_official FROM groups WHERE id = ?').get(gid);
+  if (!g) return res.status(404).json({ error: '群不存在' });
+  if (g.is_official) return res.status(400).json({ error: '不能退出官方群' });
+  db.prepare('DELETE FROM group_members WHERE group_id = ? AND user_id = ?').run(gid, req.user.id);
+  res.json({ ok: true });
+});
+
+// Disband a group (Jack / owner)
+app.post('/api/groups/:id/disband', authRequired, (req, res) => {
+  const gid = Number(req.params.id);
+  const g = db.prepare('SELECT id, is_official, owner_id FROM groups WHERE id = ?').get(gid);
+  if (!g) return res.status(404).json({ error: '群不存在' });
+  if (g.is_official) return res.status(400).json({ error: '官方群不能解散' });
+  const isOwner = g.owner_id === req.user.id;
+  const isAdmin = req.user.username === 'Jack';
+  if (!isOwner && !isAdmin) return res.status(403).json({ error: '只有群主或管理员可解散' });
+  db.prepare('DELETE FROM group_members WHERE group_id = ?').run(gid);
+  db.prepare('DELETE FROM messages WHERE conv_type = ? AND conv_id = ?').run('group', String(gid));
+  db.prepare('DELETE FROM groups WHERE id = ?').run(gid);
+  res.json({ ok: true });
+});
+
+// Discover: list recommended public groups (not joined yet)
+app.get('/api/groups/recommended', authRequired, (req, res) => {
+  const rows = db.prepare(`
+    SELECT g.id, g.name, g.description, g.icon_color, g.member_count, g.recommended,
+           (SELECT COUNT(*) FROM group_members m WHERE m.group_id = g.id AND m.user_id = ?) AS joined
+    FROM groups g
+    WHERE g.recommended = 1
+    ORDER BY g.id ASC
+    LIMIT 50
+  `).all(req.user.id);
+  res.json({ groups: rows });
 });
 
 // self-join a public group (any logged-in user can join)
@@ -1135,106 +1169,9 @@ cleanupOldMessages();
 setInterval(cleanupOldMessages, 60 * 60 * 1000); // every hour
 
 // ============================================================
-// 社区贴吧 (Forum boards) — public boards with posts & replies
+// Recommended groups (Discover) — groups with recommended=1
+// appear in the "看看大家的群聊" section.
 // ============================================================
-
-// list all boards
-app.get('/api/boards', authRequired, (req, res) => {
-  const rows = db.prepare(`
-    SELECT b.id, b.name, b.description, b.icon_color, b.creator_id, b.created_at,
-           (SELECT COUNT(*) FROM board_posts p WHERE p.board_id = b.id) AS post_count
-    FROM boards b
-    ORDER BY b.id ASC
-  `).all();
-  res.json({ boards: rows });
-});
-
-// create a new board
-app.post('/api/boards', authRequired, (req, res) => {
-  const { name, description, icon_color } = req.body || {};
-  const n = (name || '').trim();
-  if (n.length < 2 || n.length > 30) return res.status(400).json({ error: '吧名长度需 2-30 字' });
-  const existing = db.prepare('SELECT id FROM boards WHERE name = ?').get(n);
-  if (existing) return res.status(409).json({ error: '该吧名已存在' });
-  const info = db.prepare(
-    'INSERT INTO boards (name, description, icon_color, creator_id, created_at) VALUES (?, ?, ?, ?, ?)'
-  ).run(n, (description || '').slice(0, 200), icon_color || '#8b5cf6', req.user.id, now());
-  const row = db.prepare('SELECT * FROM boards WHERE id = ?').get(info.lastInsertRowid);
-  res.json({ board: row });
-});
-
-// posts in a board
-app.get('/api/boards/:id/posts', authRequired, (req, res) => {
-  const id = Number(req.params.id);
-  const rows = db.prepare(`
-    SELECT p.id, p.board_id, p.user_id, p.title, p.content, p.reply_count, p.created_at,
-           u.username, u.avatar_color, u.is_admin
-    FROM board_posts p
-    JOIN users u ON u.id = p.user_id
-    WHERE p.board_id = ?
-    ORDER BY p.created_at DESC
-    LIMIT 100
-  `).all(id);
-  res.json({ posts: rows });
-});
-
-// create a new post in a board
-app.post('/api/boards/:id/posts', authRequired, (req, res) => {
-  const id = Number(req.params.id);
-  const board = db.prepare('SELECT id FROM boards WHERE id = ?').get(id);
-  if (!board) return res.status(404).json({ error: '吧不存在' });
-  const { title, content } = req.body || {};
-  const t1 = (title || '').trim();
-  const c1 = (content || '').trim();
-  if (t1.length < 2 || t1.length > 80) return res.status(400).json({ error: '标题需 2-80 字' });
-  if (c1.length < 1 || c1.length > 5000) return res.status(400).json({ error: '内容需 1-5000 字' });
-  const info = db.prepare(`
-    INSERT INTO board_posts (board_id, user_id, title, content, reply_count, created_at)
-    VALUES (?, ?, ?, ?, 0, ?)
-  `).run(id, req.user.id, t1, c1, now());
-  const row = db.prepare(`
-    SELECT p.*, u.username, u.avatar_color, u.is_admin
-    FROM board_posts p JOIN users u ON u.id = p.user_id
-    WHERE p.id = ?
-  `).get(info.lastInsertRowid);
-  res.json({ post: row });
-});
-
-// replies on a post
-app.get('/api/posts/:id/replies', authRequired, (req, res) => {
-  const id = Number(req.params.id);
-  const rows = db.prepare(`
-    SELECT r.id, r.post_id, r.user_id, r.content, r.created_at,
-           u.username, u.avatar_color, u.is_admin
-    FROM board_replies r
-    JOIN users u ON u.id = r.user_id
-    WHERE r.post_id = ?
-    ORDER BY r.created_at ASC
-    LIMIT 200
-  `).all(id);
-  res.json({ replies: rows });
-});
-
-// add a reply
-app.post('/api/posts/:id/replies', authRequired, (req, res) => {
-  const id = Number(req.params.id);
-  const post = db.prepare('SELECT id FROM board_posts WHERE id = ?').get(id);
-  if (!post) return res.status(404).json({ error: '帖子不存在' });
-  const { content } = req.body || {};
-  const c1 = (content || '').trim();
-  if (c1.length < 1 || c1.length > 2000) return res.status(400).json({ error: '回复需 1-2000 字' });
-  const info = db.prepare(`
-    INSERT INTO board_replies (post_id, user_id, content, created_at)
-    VALUES (?, ?, ?, ?)
-  `).run(id, req.user.id, c1, now());
-  db.prepare('UPDATE board_posts SET reply_count = reply_count + 1 WHERE id = ?').run(id);
-  const row = db.prepare(`
-    SELECT r.*, u.username, u.avatar_color, u.is_admin
-    FROM board_replies r JOIN users u ON u.id = r.user_id
-    WHERE r.id = ?
-  `).get(info.lastInsertRowid);
-  res.json({ reply: row });
-});
 
 server.listen(PORT, () => {
   console.log(`[VVeChat] listening on http://0.0.0.0:${PORT}`);
