@@ -1,4 +1,4 @@
-/** VVeChat v35 - force deploy for Render */
+/**
  * VVeChat backend (v2 — online status, typing, read receipts, reactions, profile, reply, delete)
  * - Express REST API
  * - Socket.io realtime channel
