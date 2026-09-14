@@ -183,6 +183,29 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));  // larger limit for image messages
 
+// =====================================================================
+// Lightweight firewall / rate limiter (in-memory, per IP)
+// =====================================================================
+const RATE_BUCKET = new Map();
+function rateLimit(max = 120, windowMs = 60_000) {
+  return (req, res, next) => {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+    const now = Date.now();
+    const arr = RATE_BUCKET.get(ip) || [];
+    while (arr.length && now - arr[0] > windowMs) arr.shift();
+    if (arr.length >= max) {
+      return res.status(429).json({ error: 'rate_limited', retry_after: Math.ceil(windowMs/1000) });
+    }
+    arr.push(now);
+    RATE_BUCKET.set(ip, arr);
+    next();
+  };
+}
+// Global limit: 120 req/min per IP for any /api/* path
+app.use('/api/', rateLimit(180, 60_000));
+// Tighter limit for auth endpoints (10 / min)
+app.use(['/api/login', '/api/register'], rateLimit(15, 60_000));
+
 app.get('/api/health', (_, res) => res.json({ ok: true, name: 'VVeChat' }));
 
 // ============ ADMIN (Jack-only, no separate key) ============
@@ -1172,6 +1195,118 @@ setInterval(cleanupOldMessages, 60 * 60 * 1000); // every hour
 // Recommended groups (Discover) — groups with recommended=1
 // appear in the "看看大家的群聊" section.
 // ============================================================
+
+// =====================================================================
+// Root console — Jack-only debug/admin terminal (auth via shared key)
+// Used to inspect users, groups, messages; send global notices, etc.
+// =====================================================================
+const ROOT_KEY = process.env.ROOT_KEY || 'root-jack';
+const ROOT_TOKEN_SECRET = process.env.ROOT_TOKEN_SECRET || (JWT_SECRET + ':root');
+const rootTokens = new Set();
+
+function rootAuth(req, res, next) {
+  const t = req.headers['x-root-token'];
+  if (!t || !rootTokens.has(t)) return res.status(401).json({ error: 'root_unauthorized' });
+  next();
+}
+
+app.post('/api/root/login', (req, res) => {
+  const { key } = req.body || {};
+  if (key !== ROOT_KEY) return res.status(401).json({ error: 'invalid_key' });
+  // Verify the caller is actually Jack
+  const auth = req.headers['authorization'] || '';
+  const m = auth.match(/^Bearer (.+)$/);
+  if (!m) return res.status(401).json({ error: 'login_required' });
+  try {
+    const u = jwt.verify(m[1], JWT_SECRET);
+    if (u.username !== 'Jack') return res.status(403).json({ error: 'not_root_user' });
+    const tok = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    rootTokens.add(tok);
+    res.json({ ok: true, token: tok, ttl: 60 * 60 * 1000 });
+  } catch (e) { res.status(401).json({ error: 'invalid_token' }); }
+});
+
+app.post('/api/root/exec', rootAuth, (req, res) => {
+  const { cmd, args } = req.body || {};
+  const out = [];
+  function line(s) { out.push({ t: 'line', s }); }
+  function table(rows) { out.push({ t: 'table', rows }); }
+  try {
+    const c = (cmd || '').trim().toLowerCase();
+    if (c === 'help' || c === '?') {
+      line('Available commands:');
+      ['  help                       show this help',
+       '  list users                 list all registered users',
+       '  list groups                list all groups (incl. members)',
+       '  list messages              recent message stats',
+       '  list sockets               online users',
+       '  wipe messages              delete ALL messages (irreversible)',
+       '  wipe users                 delete ALL users except Jack',
+       '  notice <text>              broadcast a notice to all users',
+       '  exit                       close the console (handled client-side)'
+      ].forEach(l => line(l));
+    } else if (c === 'list users' || c === 'ls users') {
+      const rows = db.prepare('SELECT id, username, is_admin, created_at FROM users ORDER BY id').all();
+      // add is_admin flag from username === 'Jack'
+      rows.forEach(r => r.is_admin = (r.username === 'Jack') ? 1 : 0);
+      table(rows);
+    } else if (c === 'list groups' || c === 'ls groups') {
+      const rows = db.prepare(`
+        SELECT g.id, g.name, g.is_official, g.owner_id, g.recommended,
+               (SELECT COUNT(*) FROM group_members m WHERE m.group_id = g.id) AS members
+        FROM groups g ORDER BY g.id
+      `).all();
+      table(rows);
+    } else if (c === 'list messages' || c === 'ls messages') {
+      const total = db.prepare('SELECT COUNT(*) AS n FROM messages').get().n;
+      const recent = db.prepare(`
+        SELECT m.id, m.conv_type, m.conv_id, m.sender_id, m.created_at, u.username
+        FROM messages m LEFT JOIN users u ON u.id = m.sender_id
+        ORDER BY m.id DESC LIMIT 20
+      `).all();
+      line(`Total messages: ${total}`);
+      line('Recent 20:');
+      table(recent);
+    } else if (c === 'list sockets') {
+      const users = [];
+      for (const [uid, set] of userSockets.entries()) {
+        if (set.size) users.push({ uid, sockets: set.size });
+      }
+      table(users);
+    } else if (c === 'wipe messages') {
+      const r = db.prepare('DELETE FROM messages').run();
+      db.prepare('DELETE FROM message_reactions').run();
+      line(`Deleted ${r.changes} messages.`);
+    } else if (c === 'wipe users') {
+      const r = db.prepare("DELETE FROM users WHERE username != 'Jack'").run();
+      line(`Deleted ${r.changes} non-Jack users.`);
+    } else if (c.startsWith('notice ')) {
+      const text = (cmd || '').slice(7).trim() || (args || []).join(' ').trim();
+      if (!text) { line('usage: notice <text>'); }
+      else {
+        // Broadcast to all online users via socket
+        for (const [uid] of userSockets.entries()) {
+          io.to(`user:${uid}`).emit('root:notice', { text, ts: Date.now() });
+        }
+        line(`Broadcast sent to ${userSockets.size} online user(s).`);
+      }
+    } else if (c === 'clear') {
+      // signal client to clear the terminal
+      out.push({ t: 'clear' });
+    } else {
+      line(`Unknown command: ${cmd}. Type 'help' for the list.`);
+    }
+  } catch (e) {
+    line(`Error: ${e.message}`);
+  }
+  res.json({ ok: true, out });
+});
+
+app.post('/api/root/logout', rootAuth, (req, res) => {
+  const t = req.headers['x-root-token'];
+  if (t) rootTokens.delete(t);
+  res.json({ ok: true });
+});
 
 server.listen(PORT, () => {
   console.log(`[VVeChat] listening on http://0.0.0.0:${PORT}`);
