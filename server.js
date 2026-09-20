@@ -333,9 +333,9 @@ app.post('/api/register', (req, res) => {
     return res.status(409).json({ error: '用户名和密码都已被注册（请至少修改一项）' });
   }
 
-  // pick a fun color for new users
+  // pick a fun color for new users (Jack is the official admin → signature gold)
   const palette = ['#5eead4','#60a5fa','#c084fc','#f472b6','#fbbf24','#fb923c','#4ade80','#22d3ee','#a78bfa','#f87171'];
-  const color = palette[Math.floor(Math.random() * palette.length)];
+  const color = username === 'Jack' ? '#fbbf24' : palette[Math.floor(Math.random() * palette.length)];
 
   const hash = bcrypt.hashSync(password, 10);
   const info = db.prepare(
