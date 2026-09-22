@@ -1353,7 +1353,7 @@ body.dark .msg-action-bar {
 .hello-splash {
   position: fixed;
   inset: 0;
-  z-index: 9999;
+  z-index: 50;  /* below modals (1200) so modals always win */
   display: flex;
   align-items: center;
   justify-content: center;

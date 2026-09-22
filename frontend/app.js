@@ -1891,6 +1891,15 @@
   // ---------- bootstrap ----------
   function enterApp() {
     showApp();
+    // ALWAYS hide the splash overlay on enter — it covers everything
+    // (z-index 9999) and otherwise swallows all clicks/visibility.
+    const _splash = $('#hello-splash');
+    if (_splash) {
+      _splash.classList.add('hidden');
+      _splash.style.display = 'none';
+      _splash.style.pointerEvents = 'none';
+    }
+    splashDismissed = true;
     bindAppEvents();         // <-- always bind so refresh works
     renderTopbarAvatar();
     connectSocket();
