@@ -1467,6 +1467,8 @@ body.dark .hello-splash-hint {
   pointer-events: auto;
 }
 .modal:not(.hidden) { pointer-events: auto; }
+/* Belt + suspenders: make absolutely sure `.hidden` wins over `.modal { display: flex }` */
+.modal.hidden { display: none !important; pointer-events: none !important; }
 .modal-mask {
   position: absolute; inset: 0;
   background: rgba(28, 42, 62, 0.20);

@@ -665,8 +665,17 @@
     else if (mql.addListener) mql.addListener(handler);
   }
   initTheme();
-  function openModal(id) { $('#'+id)?.classList.remove('hidden'); }
-  function closeModal(id) { $('#'+id)?.classList.add('hidden'); hideSuggestions(); }
+  function openModal(id) {
+    const el = $('#'+id); if (!el) return;
+    el.classList.remove('hidden');
+    el.style.display = '';   // clear any inline display:none from previous close
+  }
+  function closeModal(id) {
+    const el = $('#'+id); if (!el) return;
+    el.classList.add('hidden');
+    el.style.display = 'none';   // belt + suspenders — make sure it actually hides
+    hideSuggestions();
+  }
   function switchAuthTab(mode) {
     authMode = mode;
     $$('.auth-card .tab').forEach(t => t.classList.toggle('active', t.dataset.tab === mode));
@@ -2136,9 +2145,24 @@
     });
 
     // modal close
-    $$('[data-close]').forEach(el => el.addEventListener('click', () => closeModal(el.dataset.close)));
-    $$('.modal-mask').forEach(el => el.addEventListener('click', (e) => { if (e.target.closest('.modal')) closeModal(e.target.closest('.modal').id); }));
+    $$('[data-close]').forEach(el => el.addEventListener('click', (e) => { e.stopPropagation(); closeModal(el.dataset.close); }));
+    $$('.modal-mask').forEach(el => el.addEventListener('click', (e) => { if (e.target === el) closeModal(el.parentElement?.id || el.closest('.modal')?.id); }));
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { $$('.modal:not(.hidden)').forEach(m => closeModal(m.id)); $('#emoji-picker')?.classList.add('hidden'); } });
+    // ULTIMATE FALLBACK: document-level delegation. If anything above
+    // somehow missed (timing, duplicate listeners, etc.), this still works.
+    document.addEventListener('click', (e) => {
+      const closeEl = e.target.closest('[data-close]');
+      if (closeEl && closeEl.dataset.close) {
+        e.stopPropagation();
+        closeModal(closeEl.dataset.close);
+        return;
+      }
+      // Also close on backdrop tap (target is exactly the .modal-mask)
+      if (e.target.classList && e.target.classList.contains('modal-mask')) {
+        const modal = e.target.closest('.modal');
+        if (modal) closeModal(modal.id);
+      }
+    }, true /* capture so we run before any other handler can swallow it */);
   }
 
   // ---------- init ----------
