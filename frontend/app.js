@@ -699,6 +699,9 @@
   function renderTopbarAvatar() {
     const el = $('#topbar-avatar');
     if (!el || !state.user) return;
+    // Jack ALWAYS gets the signature gold — don't trust stale localStorage.
+    const isJack = state.user.username === 'Jack' || !!state.user.is_admin;
+    const color = isJack ? '#fbbf24' : (state.user.avatar_color || '#5eead4');
     const letter = initials(state.user.username);
     // Always show the user's first letter (or upload image if set)
     el.textContent = letter;
@@ -708,11 +711,10 @@
       el.style.backgroundSize = 'cover';
       el.style.backgroundPosition = 'center';
       el.style.backgroundColor = 'transparent';
+      el.style.background = '';
     } else {
       el.style.backgroundImage = '';
-      el.style.background = state.user.avatar_color
-        ? `linear-gradient(135deg, ${state.user.avatar_color}, ${shade(state.user.avatar_color, -25)})`
-        : '';
+      el.style.background = `linear-gradient(135deg, ${color}, ${shade(color, -25)})`;
     }
     // Force white text + sizing inline so no CSS rule can hide the letter
     el.style.color = '#ffffff';
@@ -723,7 +725,7 @@
     el.style.alignItems = 'center';
     el.style.justifyContent = 'center';
     // Jack gets signature gold glow on topbar avatar
-    el.classList.toggle('avatar-jack-glow', !!state.user.is_admin);
+    el.classList.toggle('avatar-jack-glow', isJack);
     // show Jack pill if this user is Jack — append to topbar-right (sibling of profile btn)
     const existing = $('#topbar-jack-pill');
     if (existing) existing.remove();
@@ -1913,6 +1915,20 @@
     renderTopbarAvatar();
     connectSocket();
     refreshAll();
+    // Always re-fetch the canonical user object from the server so that
+    // any fields stale in localStorage (avatar_color, is_admin, etc.)
+    // get refreshed without forcing the user to log out + back in.
+    fetchMe().then(() => renderTopbarAvatar());
+  }
+  // Pull the latest /me record and merge it into state.user + localStorage.
+  async function fetchMe() {
+    try {
+      const r = await api('/me');
+      if (r && r.user) {
+        Object.assign(state.user, r.user);
+        try { localStorage.setItem('vve:user', JSON.stringify(state.user)); } catch (_) {}
+      }
+    } catch (_) { /* not logged in or transient error — ignore */ }
   }
   function logout() {
     state.user=null; state.token=null; state.conversations=[]; state.friends=[]; state.groups=[]; state.requests=[];
